@@ -43,7 +43,7 @@ vLLM-Lite 的设计遵循“核心功能模块化”原则：
 ### 1. 环境准备
 确保你的环境中安装了 CUDA 12.x 以及 Flash Attention 2.0+：
 ```bash
-pip install torch transformers pyyaml flash-attn --no-build-isolation
+pip install torch transformers==4.43.1 pyyaml flash-attn --no-build-isolation
 ```
 ### 2. 配置参数
 在 config.yaml 中设置你的模型路径（默认支持 Qwen2 / Llama 等主流架构）：
