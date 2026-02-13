@@ -38,7 +38,7 @@ vLLM-Lite's design follows the principle of "core functionality modularization":
 ### 1. Environment Setup
 Ensure your environment has CUDA 12.x and Flash Attention 2.0+ installed:
 ```bash
-pip install torch transformers pyyaml flash-attn --no-build-isolation
+pip install torch transformers==4.43.1 pyyaml flash-attn --no-build-isolation
 ```
 
 ### 2. Configuration
