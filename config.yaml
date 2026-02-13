@@ -1,0 +1,19 @@
+# 模型路径
+model_path: "/root/.cache/modelscope/hub/models/Qwen/Qwen2___5-0___5B-Instruct"
+
+# 显存管理 (PagedAttention)
+cache_config:
+  num_blocks: 1024      # 总 Block 数量
+  block_size: 256       # 每个 Block 的 Token 数
+  extra_token_slot: 128 # 预分配时额外留出的空间
+
+# 引擎调度
+engine_config:
+  max_batch_size: 20
+  max_gen_len: 512
+  sampling_type: "greedy" # 目前代码实现的是 argmax (贪婪搜索)
+
+# 分布式设置
+dist_config:
+  master_addr: "127.0.0.1"
+  master_port: "29506"
