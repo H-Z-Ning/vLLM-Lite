@@ -3,7 +3,7 @@ import torch
 import torch.distributed as dist
 import time
 import gc
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from kernel import BlockManager
 from model import VLLMLite
 
@@ -89,7 +89,6 @@ class Engine:
             token_id = next_tokens[i].item()
             seq.generated_ids.append(token_id)
             
-            # 这里的 logic 可以改为 Streaming，但为了简单，我们结束时一次性返回
             if token_id == self.tokenizer.eos_token_id or len(seq.generated_ids) >= seq.max_gen_len:
                 seq.finished = True
                 self.block_mgr.free_request(seq.request_id)
@@ -106,21 +105,20 @@ def profile_memory(model, config, world_size):
     # 获取总显存和已用显存
     total_gpu_mem = torch.cuda.get_device_properties(0).total_memory
     used_mem = torch.cuda.memory_allocated()
+    # 按照比例预留显存
     available_mem = total_gpu_mem * config['cache_config']['gpu_memory_utilization'] - used_mem
     
-    # 计算单个 Block 的大小 (Bytes)
-    # Block 包含: Layer * 2 (K,V) * Heads * HeadDim * BlockSize * sizeof(FP16)
     attn_conf = model.layers[0].attn
     num_layers = len(model.layers)
     block_size = config['cache_config']['block_size']
-    num_kv_heads = attn_conf.num_kv_heads # 这里的 heads 已经是 TP 后的了
+    num_kv_heads = attn_conf.num_kv_heads
     head_dim = attn_conf.head_dim
     
     # FP16 = 2 bytes
     one_block_cache_size = num_layers * 2 * num_kv_heads * head_dim * block_size * 2
     
     num_blocks = int(available_mem // one_block_cache_size)
-    return max(num_blocks, 64) # 至少留 64 个防止报错
+    return max(num_blocks, 64)
 
 def worker(rank, world_size, config, input_queue, result_queue):
     if world_size > 1:
@@ -130,12 +128,33 @@ def worker(rank, world_size, config, input_queue, result_queue):
 
     torch.cuda.set_device(rank)
     tokenizer = AutoTokenizer.from_pretrained(config['model_path'])
-    # 加载模型
-    hf_model = AutoModelForCausalLM.from_pretrained(config['model_path'], torch_dtype=torch.float16, device_map="cpu")
-    model = VLLMLite(hf_model.config).to("cuda").to(torch.float16).eval()
+    
+    # --- 核心修改点：显存避峰加载逻辑 ---
+    # 1. 先加载 Config
+    hf_cfg = AutoConfig.from_pretrained(config['model_path'])
+    
+    # 2. 在 CPU 上初始化 VLLMLite 模型，并转为 half 精度以节省内存
+    model = VLLMLite(hf_cfg).half() 
+    
+    # 3. 将原始模型加载到 CPU 内存 (device_map="cpu")
+    if rank == 0: print("⏳ Loading weights from disk to CPU RAM...")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        config['model_path'], 
+        torch_dtype=torch.float16, 
+        device_map="cpu"
+    )
+    
+    # 4. 填充权重到 VLLMLite
     model.load_weights_tp(hf_model.state_dict())
+    
+    # 5. 立即彻底释放原始模型权重
     del hf_model
     gc.collect()
+    
+    # 6. 将填充好权重的模型移至 GPU
+    if rank == 0: print(f"🚀 Moving model to GPU {rank}...")
+    model = model.to("cuda").eval()
+    # -----------------------------------
 
     # 1. 显存分析
     num_blocks = profile_memory(model, config, world_size)
@@ -152,32 +171,25 @@ def worker(rank, world_size, config, input_queue, result_queue):
 
     engine = Engine(model, tokenizer, block_mgr, config, result_queue)
 
-    # 2. 持续循环监听请求
     while True:
-        # 1. 只有 Rank 0 负责从队列取任务并广播
         requests_to_add = []
         if rank == 0:
-            while not input_queue.empty() and len(requests_to_add) < 8: # 限制单次加入量
+            # 限制单次加入量
+            while not input_queue.empty() and len(requests_to_add) < 8:
                 requests_to_add.append(input_queue.get())
         
-        # 2. 同步请求到所有 GPU
         if world_size > 1:
-            # 简单起见，这里使用 broadcast 同步请求数据
             requests_to_add = broadcast_object_list(requests_to_add, src=0)
 
-        # 3. 将新请求加入 engine
         for req_id, prompt_ids, max_len in requests_to_add:
             engine.add_request(req_id, prompt_ids, max_len)
         
-        # 4. 所有的 Rank 同时执行 step
-        # 即使没有任务，也要一起进入 step，内部 all_reduce 才会通过
         work_done = engine.step()
         
         if not work_done and not requests_to_add:
             time.sleep(0.01)
 
 def broadcast_object_list(obj_list, src=0):
-    # 简单的封装，确保所有进程拿到一样的 List
     import torch.distributed as dist
     container = [obj_list]
     dist.broadcast_object_list(container, src=src)
