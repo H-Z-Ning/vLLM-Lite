@@ -93,12 +93,41 @@ class AttentionPaged(nn.Module):
             dist.all_reduce(output)
         return output
 
+
     def _write_to_paged_cache(self, k, v, request_ids, pos_list, block_mgr):
-        for i in range(len(request_ids)):
-            rid = request_ids[i]
-            pos = pos_list[i].item()
-            block_list = block_mgr.request_to_blocks[rid]
-            b_idx = block_list[pos // block_mgr.block_size]
-            b_offset = pos % block_mgr.block_size
-            block_mgr.k_cache[self.layer_idx, b_idx, b_offset] = k[i].half()
-            block_mgr.v_cache[self.layer_idx, b_idx, b_offset] = v[i].half()
+        """
+        高性能向量化写入：一次性将整个 Batch 的 KV 写入 Paged Cache
+        """
+        if len(request_ids) == 0:
+            return
+
+        # 1. 准备索引数据
+        # pos_list 形状为 [B_total], 存储了每个 token 在各自 sequence 中的位置
+        # block_size 是每个块的大小
+        pos_tensor = pos_list.to(torch.long)
+        
+        # 计算每个 token 属于该 request 的第几个 block
+        block_table_idx = pos_tensor // block_mgr.block_size
+        # 计算每个 token 在 block 内部的偏移量
+        block_offsets = pos_tensor % block_mgr.block_size
+
+        # 2. 获取每个请求对应的物理块 ID
+        # 我们需要从 block_mgr.request_to_blocks 中提取物理 block_id
+        # 为了向量化，我们需要构造一个物理块索引数组
+        physical_block_ids = []
+        for i, rid in enumerate(request_ids):
+            # 获取该请求分配到的块列表
+            req_blocks = block_mgr.request_to_blocks[rid]
+            # 找到当前 token 应该写入的具体物理块 ID
+            physical_block_ids.append(req_blocks[block_table_idx[i].item()])
+        
+        physical_block_ids = torch.tensor(physical_block_ids, device=k.device, dtype=torch.long)
+
+        # 3. 执行向量化写入 (原地操作)
+        # k 的形状: [B_total, num_kv_heads, head_dim]
+        # k_cache 形状: [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        
+        # 使用高级索引：一次性写入所有 token 的 KV
+        # 这里 layer_idx 是固定的，physical_block_ids 和 block_offsets 对应 B_total
+        block_mgr.k_cache[self.layer_idx, physical_block_ids, block_offsets] = k.half()
+        block_mgr.v_cache[self.layer_idx, physical_block_ids, block_offsets] = v.half()
