@@ -1,16 +1,16 @@
 # 模型路径
-model_path: "/root/.cache/modelscope/hub/models/Qwen/Qwen2___5-0___5B-Instruct"
+model_path: "/root/base_model/qwen/Qwen2___5-0___5B-Instruct"
 
 # 显存管理 (PagedAttention)
 cache_config:
-  gpu_memory_utilization: 0.9  # 预留 90% 的剩余显存给 KV Cache
+  gpu_memory_utilization: 0.8  # 预留 90% 的剩余显存给 KV Cache
   block_size: 256       # 每个 Block 的 Token 数
-  extra_token_slot: 128 # 预分配时额外留出的空间
+  extra_token_slot: 256 # 预分配时额外留出的空间
 
 # 引擎调度
 engine_config:
   max_batch_size: 32
-  max_gen_len: 1024
+  max_gen_len: 2048
   sampling_type: "greedy" # 目前代码实现的是 argmax (贪婪搜索)
 
 # 分布式设置
