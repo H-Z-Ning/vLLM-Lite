@@ -64,7 +64,7 @@ async def chat_completions(request: Request):
     input_queue.put((req_id, prompt_ids, max_gen_len))
     
     try:
-        await asyncio.wait_for(event.wait(), timeout=120)
+        await asyncio.wait_for(pending_events[req_id].wait(), timeout=120)
         response_text = pending_results.pop(req_id)
     except asyncio.TimeoutError:
         return JSONResponse({"error": "Inference Timeout"}, status_code=504)
