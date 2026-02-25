@@ -70,21 +70,32 @@ class AttentionPaged(nn.Module):
             )
             self._write_to_paged_cache(k, v, request_ids, pos_list, block_mgr)
         else:
-            # 3. Decode 阶段
-            q, k, v = q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)
+            q = q.unsqueeze(1) 
+            # 这里的 k, v 是当前步的，也要转为 [B, 1, H, D]
+            k = k.unsqueeze(1)
+            v = v.unsqueeze(1)
+            
             max_blocks = max(len(block_mgr.request_to_blocks[rid]) for rid in request_ids)
-            block_table = torch.full((B_total, max_blocks), -1, device=x.device, dtype=torch.int32)
+            
+            # 使用 -1 填充未使用的 block_table 槽位，有些算子支持，
+            # 若不支持则保持 0 但必须确保分配逻辑正确
+            block_table = torch.zeros((B_total, max_blocks), device=x.device, dtype=torch.int32)
+            
             for i, rid in enumerate(request_ids):
                 blocks = block_mgr.request_to_blocks[rid]
-                block_table[i, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32)
+                block_table[i, :len(blocks)] = torch.tensor(blocks, device=x.device, dtype=torch.int32)
 
+            # 注意：flash_attn_with_kvcache 会自动将当前步的 k,v 写入 k_cache/v_cache
             output = flash_attn_with_kvcache(
-                q=q.half(), k=k.half(), v=v.half(),
-                k_cache=block_mgr.k_cache[self.layer_idx].half(),
-                v_cache=block_mgr.v_cache[self.layer_idx].half(),
-                cache_seqlens=pos_list.to(torch.int32) + 1,
+                q=q.half(), 
+                k=k.half(), 
+                v=v.half(),
+                k_cache=block_mgr.k_cache[self.layer_idx], 
+                v_cache=block_mgr.v_cache[self.layer_idx],
+                cache_seqlens=pos_list.to(torch.int32) + 1, # 包含当前 token 的总长度
                 block_table=block_table,
-                softmax_scale=self.scale, causal=True
+                softmax_scale=self.scale, 
+                causal=True
             )
 
         # 4. 修正缩进后的输出逻辑
@@ -92,8 +103,15 @@ class AttentionPaged(nn.Module):
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(output)
         return output
-
-
+    # def _write_to_paged_cache(self, k, v, request_ids, pos_list, block_mgr):
+    #     for i in range(len(request_ids)):
+    #         rid = request_ids[i]
+    #         pos = pos_list[i].item()
+    #         block_list = block_mgr.request_to_blocks[rid]
+    #         b_idx = block_list[pos // block_mgr.block_size]
+    #         b_offset = pos % block_mgr.block_size
+    #         block_mgr.k_cache[self.layer_idx, b_idx, b_offset] = k[i].half()
+    #         block_mgr.v_cache[self.layer_idx, b_idx, b_offset] = v[i].half()
     def _write_to_paged_cache(self, k, v, request_ids, pos_list, block_mgr):
         """
         高性能向量化写入：一次性将整个 Batch 的 KV 写入 Paged Cache
@@ -116,10 +134,13 @@ class AttentionPaged(nn.Module):
         # 为了向量化，我们需要构造一个物理块索引数组
         physical_block_ids = []
         for i, rid in enumerate(request_ids):
-            # 获取该请求分配到的块列表
             req_blocks = block_mgr.request_to_blocks[rid]
-            # 找到当前 token 应该写入的具体物理块 ID
-            physical_block_ids.append(req_blocks[block_table_idx[i].item()])
+            # 确保索引不越界
+            idx = block_table_idx[i].item()
+            if idx >= len(req_blocks):
+                # 动态追加分配逻辑（或者在 prefill 前确保分配够了）
+                raise RuntimeError(f"Request {rid} needs more blocks than allocated!")
+            physical_block_ids.append(req_blocks[idx])
         
         physical_block_ids = torch.tensor(physical_block_ids, device=k.device, dtype=torch.long)
 
