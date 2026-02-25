@@ -8,12 +8,47 @@ from kernel import BlockManager
 from model import VLLMLite
 
 class Sequence:
-    def __init__(self, request_id, prompt_ids, max_gen_len=512):
+    def __init__(self, request_id, prompt_ids, max_gen_len=2048):
         self.request_id = request_id
         self.prompt_ids = prompt_ids
         self.generated_ids = prompt_ids.copy()
         self.max_gen_len = max_gen_len
         self.finished = False
+
+
+def sample_logits(logits, sequence_ids, repetition_penalty=1.1, temperature=0.7, top_p=0.8):
+    # 1. 必须 clone，否则 InferenceMode 会报错
+    logits = logits.clone()
+
+    # 2. 重复惩罚
+    if repetition_penalty != 1.0:
+        score = torch.gather(logits, 1, sequence_ids)
+        score = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
+        logits.scatter_(1, sequence_ids, score)
+
+    # 3. Temperature 缩放
+    logits = logits / max(temperature, 1e-5)
+
+    # 4. Top-P (Nucleus Sampling) 过滤
+    if top_p < 1.0:
+        # 对 logits 进行降序排列
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # 移除累积概率超过 top_p 的 token
+        sorted_indices_to_remove = cumulative_probs > top_p
+        # 保留第一个超过阈值的 token (保证至少有一个候选)
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+
+        # 将被过滤掉的 token 概率设为负无穷
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = float('-inf')
+
+    # 5. 最终采样
+    probs = torch.softmax(logits, dim=-1)
+    next_token = torch.multinomial(probs, num_samples=1)
+    return next_token.squeeze(-1)
 
 class Engine:
     def __init__(self, model, tokenizer, block_mgr, config, result_queue):
@@ -75,8 +110,21 @@ class Engine:
         for i, seq in enumerate(seqs):
             seq.generated_ids.append(next_tokens[i].item())
 
+
+
+            
+
+    
     def _handle_decode(self):
         if not self.running_batch: return
+        
+        # --- 新增：动态分配块 ---
+        for seq in self.running_batch:
+            current_len = len(seq.generated_ids)
+            # 如果当前 token 位置即将超出已分配块的覆盖范围，再分一个块
+            self.block_mgr.allocate_blocks_for_request(seq.request_id, current_len + 1)
+        # ----------------------
+
         input_tokens = torch.tensor([s.generated_ids[-1] for s in self.running_batch], device="cuda")
         req_ids = [s.request_id for s in self.running_batch]
         pos_list = torch.tensor([len(s.generated_ids)-1 for s in self.running_batch], device="cuda", dtype=torch.int32)
@@ -84,14 +132,36 @@ class Engine:
         with torch.inference_mode():
             logits = self.model(input_tokens, req_ids, pos_list, self.block_mgr, is_prefill=False)
         
-        next_tokens = logits.argmax(dim=-1)
+        # --- 修改采样逻辑 ---
+        next_tokens = []
         for i, seq in enumerate(self.running_batch):
-            token_id = next_tokens[i].item()
+            # 这里的 sequence_ids 需要是 2D 的 [1, len]
+            seq_history = torch.tensor([seq.generated_ids], device=logits.device)
+            single_logits = logits[i:i+1] 
+            
+            # 这里返回的是一个 int 或者 0维张量
+            token_id = sample_logits(
+                single_logits, 
+                seq_history, 
+                repetition_penalty=1.1,
+                temperature=0.7
+            )
+            # 统一转成 Python int 存入 list
+            if isinstance(token_id, torch.Tensor):
+                token_id = token_id.item()
+            next_tokens.append(token_id)
+        
+        # 定义 Qwen 特有的停止符 ID
+        stop_tokens = {self.tokenizer.eos_token_id, 151645} 
+
+        for i, seq in enumerate(self.running_batch):
+            token_id = next_tokens[i]
             seq.generated_ids.append(token_id)
             
-            if token_id == self.tokenizer.eos_token_id or len(seq.generated_ids) >= seq.max_gen_len:
+            if token_id in stop_tokens or len(seq.generated_ids) >= seq.max_gen_len:
                 seq.finished = True
                 self.block_mgr.free_request(seq.request_id)
+                # 解码时跳过 prompt 部分
                 response = self.tokenizer.decode(seq.generated_ids[len(seq.prompt_ids):], skip_special_tokens=True)
                 self.result_queue.put((seq.request_id, response))
         
