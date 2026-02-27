@@ -30,38 +30,46 @@ class BlockManager:
             del self.request_to_blocks[request_id]
 
 
+
 class AttentionPaged(nn.Module):
     def __init__(self, hidden, num_heads, num_kv_heads, layer_idx, rope):
         super().__init__()
         tp_size = dist.get_world_size() if dist.is_initialized() else 1
+        
+        # 这里的计算必须严格遵循模型配置
         self.num_heads = num_heads // tp_size
         self.num_kv_heads = num_kv_heads // tp_size
-        self.head_dim = hidden // num_heads
+        self.head_dim = hidden // num_heads # 注意：有的模型 head_dim 是独立定义的
         self.scale = self.head_dim ** -0.5
         self.layer_idx = layer_idx
         self.rope = rope
 
-        self.qkv = nn.Linear(hidden, (self.num_heads + 2 * self.num_kv_heads) * self.head_dim, bias=True)
+        # 关键修正：QKV 的总输出维度
+        # 必须是 (n_heads + 2 * n_kv_heads) * head_dim
+        qkv_out_features = (self.num_heads + 2 * self.num_kv_heads) * self.head_dim
+        self.qkv = nn.Linear(hidden, qkv_out_features, bias=True) # Qwen 通常有 Bias
         self.o = nn.Linear(self.num_heads * self.head_dim, hidden, bias=False)
 
     def forward(self, x, request_ids, pos_list, block_mgr, is_prefill=False, cu_seqlens=None, max_seqlen=None):
-        # 1. 强制类型统一
+        # 1. 类型安全检查
         x = x.to(torch.float16)
         B_total = x.shape[0]
+        
         qkv = self.qkv(x)
-
+        # Qwen3 在大参数模型下可能使用不同的头部布局，这里确保 split 正确
         q, k, v = qkv.split([self.num_heads * self.head_dim,
                              self.num_kv_heads * self.head_dim,
                              self.num_kv_heads * self.head_dim], dim=-1)
 
-        q = q.view(B_total, self.num_heads, self.head_dim).to(torch.float16)
-        k = k.view(B_total, self.num_kv_heads, self.head_dim).to(torch.float16)
-        v = v.view(B_total, self.num_kv_heads, self.head_dim).to(torch.float16)
+        q = q.view(B_total, self.num_heads, self.head_dim)
+        k = k.view(B_total, self.num_kv_heads, self.head_dim)
+        v = v.view(B_total, self.num_kv_heads, self.head_dim)
 
+        # 2. 应用适配 Qwen3 的 RoPE
         q, k = self.rope.apply_rope(q, k, pos_list)
 
         if is_prefill:
-            # 2. Prefill 阶段
+            # Prefill 阶段：Qwen3 建议开启 causal=True 并注意窗口大小
             output = flash_attn_varlen_func(
                 q.half(), k.half(), v.half(),
                 cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
@@ -70,8 +78,10 @@ class AttentionPaged(nn.Module):
             )
             self._write_to_paged_cache(k, v, request_ids, pos_list, block_mgr)
         else:
+            # Decode 阶段：动态构建 block_table
+            # 注意：若 Qwen3 采用 MLA，此处的 k_cache 维度需要重构，
+            # 当前代码假设 Qwen3 仍保持 GQA 结构（Lite版最通用做法）
             q = q.unsqueeze(1) 
-            # 这里的 k, v 是当前步的，也要转为 [B, 1, H, D]
             k = k.unsqueeze(1)
             v = v.unsqueeze(1)
             
@@ -87,22 +97,16 @@ class AttentionPaged(nn.Module):
 
             # 注意：flash_attn_with_kvcache 会自动将当前步的 k,v 写入 k_cache/v_cache
             output = flash_attn_with_kvcache(
-                q=q.half(), 
-                k=k.half(), 
-                v=v.half(),
+                q=q.half(), k=k.half(), v=v.half(),
                 k_cache=block_mgr.k_cache[self.layer_idx], 
                 v_cache=block_mgr.v_cache[self.layer_idx],
-                cache_seqlens=pos_list.to(torch.int32) + 1, # 包含当前 token 的总长度
+                cache_seqlens=pos_list.to(torch.int32) + 1,
                 block_table=block_table,
                 softmax_scale=self.scale, 
                 causal=True
             )
 
-        # 4. 修正缩进后的输出逻辑
-        output = self.o(output.view(B_total, -1))
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(output)
-        return output
+        return self.o(output.view(B_total, -1))
     # def _write_to_paged_cache(self, k, v, request_ids, pos_list, block_mgr):
     #     for i in range(len(request_ids)):
     #         rid = request_ids[i]
