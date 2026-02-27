@@ -1,6 +1,6 @@
 # 模型路径
 model_path: "/root/base_model/qwen/Qwen2___5-0___5B-Instruct"
-
+# model_path: "/root/autodl-tmp/models/qwen/Qwen3-4B-Instruct-2507"
 # 显存管理 (PagedAttention)
 cache_config:
   gpu_memory_utilization: 0.8  # 预留 90% 的剩余显存给 KV Cache
