@@ -68,6 +68,27 @@ streamlit run frontend.py --server.port 6006
 
 ---
 
+## 🚀 Performance Benchmark Comparison (Benchmark Results)
+
+We conducted a concurrency stress test comparing **vLLM-Lite** with the original **HuggingFace Transformers**. The tests were performed using the same hardware environment and model (Qwen2.5-0.5B).
+
+| Concurrency | Framework       | Throughput   | Avg Latency | Speedup |
+| ----------- | --------------- | ------------ | ----------- | ------- |
+| **1**       | HuggingFace     | 139.45 tokens/s | 1.74 s      | 1.00x   |
+|             | **vLLM-Lite**   | 128.82 tokens/s | **1.23 s**  | 0.92x   |
+| **4**       | HuggingFace     | 140.64 tokens/s | 6.81 s      | 1.00x   |
+|             | **vLLM-Lite**   | **388.42 tokens/s** | **1.62 s**  | **2.76x** |
+| **8**       | HuggingFace     | 140.89 tokens/s | 12.65 s     | 1.00x   |
+|             | **vLLM-Lite**   | **677.04 tokens/s** | **1.87 s**  | **4.81x** |
+| **16**      | HuggingFace     | 140.98 tokens/s | 22.61 s     | 1.00x   |
+|             | **vLLM-Lite**   | **944.55 tokens/s** | **2.65 s**  | **6.70x** |
+| **32**      | HuggingFace     | 142.31 tokens/s | 41.14 s     | 1.00x   |
+|             | **vLLM-Lite**   | **1376.29 tokens/s** | **3.66 s**  | **9.67x** |
+
+
+
+---
+
 ## 💡 Why This Project Deserves Your Attention?
 
 * **See Through PagedAttention**: The complex C++ memory paging logic is simplified into Python `list` operations within the `BlockManager` class, allowing you to grasp the core secret of vLLM at a glance.
