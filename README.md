@@ -70,19 +70,23 @@ streamlit run frontend.py --server.port 6006
 
 
 ---
-## 📊 vLLM-Lite VS huggingface transformers
-使用vLLM-Lite与原始的huggingface transformers并发测试对比
-Concurrency (并发数),Framework,Throughput (tokens/s),Avg Latency (s),Speedup (vs HF)
-1,HuggingFace,139.45,1.74,1.00x
-,vLLM-Lite,128.82,1.23,0.92x
-4,HuggingFace,140.64,6.81,1.00x
-,vLLM-Lite,388.42,1.62,2.76x
-8,HuggingFace,140.89,12.65,1.00x
-,vLLM-Lite,677.04,1.87,4.81x
-16,HuggingFace,140.98,22.61,1.00x
-,vLLM-Lite,944.55,2.65,6.70x
-32,HuggingFace,142.31,41.14,1.00x
-,vLLM-Lite,1376.29,3.66,9.67x
+## 🚀 性能基准测试对比 (Benchmark Results)
+
+我们将 **vLLM-Lite** 与原始的 **HuggingFace Transformers** 进行了并发压力测试对比。测试使用了相同的硬件环境和模型（Qwen2.5-0.5B）。
+
+| Concurrency (并发数) | Framework (框架) | Throughput (吞吐量)  | Avg Latency (平均延迟) | Speedup (加速比) |
+| -------------------- | ---------------- | -------------------- | ---------------------- | ---------------- |
+| **1**                | HuggingFace      | 139.45 tokens/s      | 1.74 s                 | 1.00x            |
+|                      | **vLLM-Lite**    | 128.82 tokens/s      | **1.23 s**             | 0.92x            |
+| **4**                | HuggingFace      | 140.64 tokens/s      | 6.81 s                 | 1.00x            |
+|                      | **vLLM-Lite**    | **388.42 tokens/s**  | **1.62 s**             | **2.76x**        |
+| **8**                | HuggingFace      | 140.89 tokens/s      | 12.65 s                | 1.00x            |
+|                      | **vLLM-Lite**    | **677.04 tokens/s**  | **1.87 s**             | **4.81x**        |
+| **16**               | HuggingFace      | 140.98 tokens/s      | 22.61 s                | 1.00x            |
+|                      | **vLLM-Lite**    | **944.55 tokens/s**  | **2.65 s**             | **6.70x**        |
+| **32**               | HuggingFace      | 142.31 tokens/s      | 41.14 s                | 1.00x            |
+|                      | **vLLM-Lite**    | **1376.29 tokens/s** | **3.66 s**             | **9.67x**        |
+
 
 
 <img width="4200" height="1800" alt="image" src="https://github.com/user-attachments/assets/86dd6c85-7df1-4afd-8ba0-81e8fda1fdad" />
