@@ -85,7 +85,7 @@ We conducted a concurrency stress test comparing **vLLM-Lite** with the original
 | **32**      | HuggingFace     | 142.31 tokens/s | 41.14 s     | 1.00x   |
 |             | **vLLM-Lite**   | **1376.29 tokens/s** | **3.66 s**  | **9.67x** |
 
-
+<img width="1817" height="787" alt="image" src="https://github.com/user-attachments/assets/b74d22e1-8e4a-4b58-965d-342b16ae28f0" />
 
 ---
 
