@@ -51,9 +51,20 @@ cache_config:
 ```
 
 ### 3. Start Inference
+1、run main.py
 ```bash
+cd src
 python main.py
 ```
+2、run client
+```bash
+cd cli
+streamlit run frontend.py --server.port 6006
+```
+3、enter client
+<img width="1817" height="787" alt="image" src="https://github.com/user-attachments/assets/b74d22e1-8e4a-4b58-965d-342b16ae28f0" />
+
+
 
 ---
 
