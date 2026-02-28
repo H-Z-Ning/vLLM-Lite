@@ -70,6 +70,24 @@ streamlit run frontend.py --server.port 6006
 
 
 ---
+## 📊 vLLM-Lite VS huggingface transformers
+使用vLLM-Lite与原始的huggingface transformers并发测试对比
+Concurrency (并发数),Framework,Throughput (tokens/s),Avg Latency (s),Speedup (vs HF)
+1,HuggingFace,139.45,1.74,1.00x
+,vLLM-Lite,128.82,1.23,0.92x
+4,HuggingFace,140.64,6.81,1.00x
+,vLLM-Lite,388.42,1.62,2.76x
+8,HuggingFace,140.89,12.65,1.00x
+,vLLM-Lite,677.04,1.87,4.81x
+16,HuggingFace,140.98,22.61,1.00x
+,vLLM-Lite,944.55,2.65,6.70x
+32,HuggingFace,142.31,41.14,1.00x
+,vLLM-Lite,1376.29,3.66,9.67x
+
+
+<img width="4200" height="1800" alt="image" src="https://github.com/user-attachments/assets/86dd6c85-7df1-4afd-8ba0-81e8fda1fdad" />
+
+---
 
 ## 💡 为什么这个项目值得关注？
 
