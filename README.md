@@ -55,9 +55,18 @@ cache_config:
 ```
 
 ### 3. 启动推理
+1、开启后端服务
 ```bash
+cd src
 python main.py
 ```
+2、开启前端页面
+```bash
+cd cli
+streamlit run frontend.py --server.port 6006
+```
+3、访问前端使用
+<img width="1817" height="787" alt="image" src="https://github.com/user-attachments/assets/b74d22e1-8e4a-4b58-965d-342b16ae28f0" />
 
 
 ---
