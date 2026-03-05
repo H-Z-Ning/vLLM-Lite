@@ -45,10 +45,13 @@ vLLM-Lite 的设计遵循“核心功能模块化”原则：
 ```bash
 pip install torch transformers==4.43.1 pyyaml flash-attn --no-build-isolation
 ```
+```bash
+huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct --local-dir /root/base_model/qwen/
+```
 ### 2. 配置参数
 在 config.yaml 中设置你的模型路径（默认支持 Qwen2 / Llama 等主流架构）：
 ```yaml
-model_path: "Qwen/Qwen2.5-1.5B-Instruct"
+model_path: "/root/base_model/qwen/Qwen2___5-0___5B-Instruct"
 cache_config:
   num_blocks: 1024  # KV Cache 总块数
   block_size: 256   # 每个块容纳的 Token 数量
