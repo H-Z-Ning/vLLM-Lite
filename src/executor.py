@@ -47,7 +47,8 @@ def sample_logits(logits, sequence_ids, repetition_penalty=1.1, temperature=0.7,
     return next_token.squeeze(-1)
 
 class Engine:
-    def __init__(self, model, tokenizer, block_mgr, config, result_queue):
+    def __init__(self, model, tokenizer, block_mgr, config, result_queue,
+                 draft_model=None, draft_block_mgr=None):
         self.model = model
         self.tokenizer = tokenizer
         self.block_mgr = block_mgr
@@ -57,6 +58,145 @@ class Engine:
         self.max_batch = config['engine_config'].get('max_batch_size', 20)
         self.extra_slots = config['cache_config'].get('extra_token_slot', 4)
 
+        # 投机采样相关
+        self.draft_model = draft_model
+        self.draft_block_mgr = draft_block_mgr
+        spec_cfg = config.get('speculative_decoding', {})
+        self.spec_enabled = spec_cfg.get('enabled', False) and draft_model is not None
+        self.num_spec_tokens = spec_cfg.get('num_speculative_tokens', 5)
+        self.draft_sampling_params = spec_cfg.get('draft_sampling_params',
+                                                   {"temperature": 0.7, "top_p": 0.8, "repetition_penalty": 1.1})
+    def _speculative_decode(self, seq):
+        K = self.num_spec_tokens
+        request_id = seq.request_id
+        current_len = len(seq.generated_ids)
+    
+        # 确保两个缓存都有足够空间容纳最多 current_len + K 个token
+        self.block_mgr.allocate_blocks_for_request(request_id, current_len + K)
+        self.draft_block_mgr.allocate_blocks_for_request(request_id, current_len + K)
+    
+        # ---------- 1. 草稿模型生成 K 个候选token ----------
+        draft_tokens = []          # 候选 token id 列表
+        draft_logits_list = []     # 每个候选的原始 logits
+        # 临时序列，用于采样
+        temp_ids = seq.generated_ids.copy()
+        for step in range(K):
+            if step == 0:
+                input_id = temp_ids[-1]
+            else:
+                input_id = draft_tokens[-1]
+            input_tensor = torch.tensor([input_id], device="cuda")
+            pos = current_len + step   # 当前要生成的位置
+            pos_tensor = torch.tensor([pos], device="cuda", dtype=torch.int32)
+    
+            with torch.inference_mode():
+                logits = self.draft_model(
+                    input_tensor,
+                    [request_id],
+                    pos_tensor,
+                    self.draft_block_mgr,
+                    is_prefill=False
+                )   # shape [1, vocab_size]
+    
+            # 使用草稿模型的采样参数生成 token
+            token_id = sample_logits(
+                logits,
+                torch.tensor([temp_ids + draft_tokens], device=logits.device),
+                **self.draft_sampling_params
+            )
+            if isinstance(token_id, torch.Tensor):
+                token_id = token_id.item()
+            draft_tokens.append(token_id)
+            draft_logits_list.append(logits[0])   # 保存 logits 供后续验证
+    
+        # ---------- 2. 目标模型验证 ----------
+        # 输入为 draft_tokens 列表
+        input_tokens = torch.tensor(draft_tokens, device="cuda")   # [K]
+        req_ids = [request_id] * K
+        pos_list = torch.arange(current_len, current_len + K, device="cuda", dtype=torch.int32)
+    
+        with torch.inference_mode():
+            target_logits = self.model(
+                input_tokens,
+                req_ids,
+                pos_list,
+                self.block_mgr,
+                is_prefill=False
+            )   # [K, vocab_size]
+    
+        # ---------- 3. 接受/拒绝决策 ----------
+        # 将 logits 转为概率
+        draft_probs = torch.softmax(torch.stack(draft_logits_list, dim=0), dim=-1)   # [K, vocab_size]
+        target_probs = torch.softmax(target_logits, dim=-1)                          # [K, vocab_size]
+    
+        accepted = []          # 已经接受的 token
+        rejection_idx = None   # 发生拒绝的位置（如果全部接受则为 None）
+    
+        for i in range(K):
+            token = draft_tokens[i]
+            p_draft = draft_probs[i, token].item()
+            p_target = target_probs[i, token].item()
+            r = p_target / p_draft if p_draft > 0 else 1.0   # 防止除零
+    
+            if r >= 1.0 or torch.rand(1).item() < r:
+                accepted.append(token)
+            else:
+                # 拒绝，停止接受更多候选
+                rejection_idx = i
+                break
+    
+        # ---------- 4. 处理接受结果 ----------
+        if rejection_idx is None:
+            # 全部接受
+            L = K
+            seq.generated_ids.extend(accepted)
+            new_len = current_len + L
+            # 截断缓存（实际上长度刚好，无需释放，但保证一致）
+            self.block_mgr.truncate_request(request_id, new_len)
+            self.draft_block_mgr.truncate_request(request_id, new_len)
+        else:
+            # 部分接受：只接受前 rejection_idx 个
+            L = rejection_idx
+            seq.generated_ids.extend(accepted[:L])
+            new_len = current_len + L
+            # 截断缓存到 new_len
+            self.block_mgr.truncate_request(request_id, new_len)
+            self.draft_block_mgr.truncate_request(request_id, new_len)
+    
+            # 使用目标模型生成被拒绝位置的新 token（单步 decode）
+            input_tensor = torch.tensor([seq.generated_ids[-1]], device="cuda")
+            pos = new_len - 1   # 注意：新序列最后一位的位置
+            pos_tensor = torch.tensor([pos], device="cuda", dtype=torch.int32)
+            with torch.inference_mode():
+                logits = self.model(
+                    input_tensor,
+                    [request_id],
+                    pos_tensor,
+                    self.block_mgr,
+                    is_prefill=False
+                )
+            new_token = sample_logits(
+                logits,
+                torch.tensor([seq.generated_ids], device=logits.device),
+                **seq.sampling_params
+            )
+            if isinstance(new_token, torch.Tensor):
+                new_token = new_token.item()
+            seq.generated_ids.append(new_token)
+            # 新 token 的 KV 已由模型写入缓存，不需要额外操作
+    
+        # ---------- 5. 检查序列是否结束 ----------
+        stop_tokens = {
+            self.tokenizer.eos_token_id,
+            151643, 151645,
+            self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        }
+        if seq.generated_ids[-1] in stop_tokens or len(seq.generated_ids) >= seq.max_gen_len:
+            seq.finished = True
+            self.block_mgr.free_request(request_id)
+            self.draft_block_mgr.free_request(request_id)
+            response = self.tokenizer.decode(seq.generated_ids[len(seq.prompt_ids):], skip_special_tokens=True)
+            self.result_queue.put((seq.request_id, response))
     def add_request(self, req_id, prompt_ids, max_gen_len, sampling_params):
         self.waiting_queue.append(Sequence(req_id, prompt_ids, max_gen_len, sampling_params))
 
@@ -108,16 +248,26 @@ class Engine:
             seq.generated_ids.append(next_tokens[i].item())
 
     def _handle_decode(self):
-        if not self.running_batch: return
-        
+        if not self.running_batch:
+            return
+    
+        # 投机采样：仅当启用且 batch size == 1 时使用
+        if self.spec_enabled and len(self.running_batch) == 1:
+            seq = self.running_batch[0]
+            self._speculative_decode(seq)
+            # 检查是否结束（_speculative_decode 内部可能标记 finished）
+            self.running_batch = [s for s in self.running_batch if not s.finished]
+            return
+    
+        # 否则执行普通批量 decode（原有代码不变）
         for seq in self.running_batch:
             current_len = len(seq.generated_ids)
             self.block_mgr.allocate_blocks_for_request(seq.request_id, current_len + 1)
-
+    
         input_tokens = torch.tensor([s.generated_ids[-1] for s in self.running_batch], device="cuda")
         req_ids = [s.request_id for s in self.running_batch]
         pos_list = torch.tensor([len(s.generated_ids)-1 for s in self.running_batch], device="cuda", dtype=torch.int32)
-
+    
         with torch.inference_mode():
             logits = self.model(input_tokens, req_ids, pos_list, self.block_mgr, is_prefill=False)
         
@@ -180,17 +330,42 @@ def worker(rank, world_size, config, input_queue, result_queue):
     tokenizer = AutoTokenizer.from_pretrained(config['model_path'])
     hf_cfg = AutoConfig.from_pretrained(config['model_path'])
     model = VLLMLite(hf_cfg).half() 
-    
-    if rank == 0: print("⏳ Loading weights...")
+
+    if rank == 0: print("⏳ Loading target weights...")
     hf_model = AutoModelForCausalLM.from_pretrained(config['model_path'], torch_dtype=torch.float16, device_map="cpu")
     model.load_weights_tp(hf_model.state_dict())
     del hf_model
     gc.collect()
-    
     model = model.to("cuda").eval()
     num_blocks = profile_memory(model, config, world_size)
-    block_mgr = BlockManager(num_blocks, config['cache_config']['block_size'], len(model.layers), model.layers[0].attn.num_kv_heads * world_size, model.layers[0].attn.head_dim)
-    engine = Engine(model, tokenizer, block_mgr, config, result_queue)
+    block_mgr = BlockManager(num_blocks, config['cache_config']['block_size'],
+                             len(model.layers), model.layers[0].attn.num_kv_heads * world_size,
+                             model.layers[0].attn.head_dim)
+
+    # ---------- 加载草稿模型（如果启用） ----------
+    draft_model = None
+    draft_block_mgr = None
+    spec_config = config.get('speculative_decoding', {})
+    if spec_config.get('enabled', False):
+        draft_model_path = spec_config['draft_model_path']
+        if rank == 0: print("⏳ Loading draft weights...")
+        draft_hf_cfg = AutoConfig.from_pretrained(draft_model_path)
+        draft_model = VLLMLite(draft_hf_cfg).half()
+        draft_hf_model = AutoModelForCausalLM.from_pretrained(draft_model_path, torch_dtype=torch.float16, device_map="cpu")
+        draft_model.load_weights_tp(draft_hf_model.state_dict())
+        del draft_hf_model
+        gc.collect()
+        draft_model = draft_model.to("cuda").eval()
+        # 为草稿模型计算可用块数（注意显存占用需考虑两者总和，此处简化：单独计算，实际生产需精细控制）
+        draft_num_blocks = profile_memory(draft_model, config, world_size)
+        draft_block_mgr = BlockManager(draft_num_blocks, config['cache_config']['block_size'],
+                                       len(draft_model.layers), draft_model.layers[0].attn.num_kv_heads * world_size,
+                                       draft_model.layers[0].attn.head_dim)
+    # -----------------------------------------
+
+    engine = Engine(model, tokenizer, block_mgr, config, result_queue,
+                    draft_model=draft_model, draft_block_mgr=draft_block_mgr)  # 传入草稿相关组件
+
 
     while True:
         requests_to_add = []
