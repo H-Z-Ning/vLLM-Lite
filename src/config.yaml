@@ -1,19 +1,29 @@
 # 模型路径
+# model_path: "/root/autodl-tmp/qwen/Qwen2.5-7B-Instruct"
 model_path: "/root/base_model/qwen/Qwen2___5-0___5B-Instruct"
-# model_path: "/root/autodl-tmp/models/qwen/Qwen3-4B-Instruct-2507"
 # 显存管理 (PagedAttention)
 cache_config:
-  gpu_memory_utilization: 0.8  # 预留 90% 的剩余显存给 KV Cache
-  block_size: 256       # 每个 Block 的 Token 数
-  extra_token_slot: 256 # 预分配时额外留出的空间
+  gpu_memory_utilization: 0.8
+  block_size: 256
+  extra_token_slot: 256
 
 # 引擎调度
 engine_config:
   max_batch_size: 32
   max_gen_len: 2048
-  sampling_type: "greedy" # 目前代码实现的是 argmax (贪婪搜索)
+  sampling_type: "greedy"
 
 # 分布式设置
 dist_config:
   master_addr: "127.0.0.1"
   master_port: "29506"
+
+# ---------- 新增：投机采样配置 ----------
+speculative_decoding:
+  enabled: false                         # 是否启用投机采样
+  draft_model_path: "/root/base_model/qwen/Qwen2___5-0___5B-Instruct"  # 草稿模型路径（需与目标模型同架构）
+  num_speculative_tokens: 5              # 每次生成的候选token数 K
+  draft_sampling_params:                 # 草稿模型采样参数（可选）
+    temperature: 0.6
+    top_p: 0.9
+    repetition_penalty: 1.0
