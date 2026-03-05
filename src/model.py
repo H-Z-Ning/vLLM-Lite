@@ -78,13 +78,14 @@ class DecoderLayer(nn.Module):
 class VLLMLite(nn.Module):
     def __init__(self, hf_config):
         super().__init__()
+        self.cfg = hf_config  # <-- 必须添加这一行，否则 load_weights_tp 找不到 cfg
         cfg = hf_config
+        
         self.embedding = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         
-        # 修复后的 RoPE Scaling 获取逻辑
+        # RoPE 相关逻辑...
         rope_st = getattr(cfg, "rope_scaling", {})
-        if rope_st is None: rope_st = {}
-        scaling_factor = rope_st.get("factor", 1.0)
+        scaling_factor = rope_st.get("factor", 1.0) if rope_st else 1.0
 
         self.rope = Qwen3RoPE(
             cfg.hidden_size // cfg.num_attention_heads, 
@@ -92,7 +93,6 @@ class VLLMLite(nn.Module):
             scaling_factor=scaling_factor
         )
         
-        # 现在调用 DecoderLayer 就不会报错了，因为上面已经定义了
         self.layers = nn.ModuleList([
             DecoderLayer(cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, 
                          cfg.intermediate_size, i, self.rope)
@@ -104,45 +104,63 @@ class VLLMLite(nn.Module):
     def load_weights_tp(self, hf_sd):
         rank = get_tp_rank()
         tp_size = get_tp_size()
+        cfg = self.cfg  # 现在这里不会报错了
 
+        # 基础权重加载
         self.embedding.weight.data.copy_(hf_sd["model.embed_tokens.weight"])
-        
-        # 适配 Tied Weights
         if "lm_head.weight" in hf_sd:
             self.lm_head.weight.data.copy_(hf_sd["lm_head.weight"])
-        else:
-            self.lm_head.weight = self.embedding.weight 
-
         self.norm.weight.data.copy_(hf_sd["model.norm.weight"])
 
         for i, layer in enumerate(self.layers):
             p = f"model.layers.{i}"
             
-            # 1. 提取原始权重并进行 TP 切分
-            # 注意：Q, K, V 必须分别切分后再合并
-            Wq = hf_sd[f"{p}.self_attn.q_proj.weight"].chunk(tp_size, dim=0)[rank]
-            Wk = hf_sd[f"{p}.self_attn.k_proj.weight"].chunk(tp_size, dim=0)[rank]
-            Wv = hf_sd[f"{p}.self_attn.v_proj.weight"].chunk(tp_size, dim=0)[rank]
+            # --- 关键：针对 GQA 的 QKV 切分 ---
+            # Qwen 的权重维度是 [out_features, in_features]
+            # 我们需要先按 Head 展开，再在 Head 维度切分，确保 KV 对应关系正确
+            head_dim = cfg.hidden_size // cfg.num_attention_heads
             
-            # 打印一下维度，方便调试（可选）
-            # if rank == 0 and i == 0:
-            #     print(f"DEBUG: Wq={Wq.shape}, Wk={Wk.shape}, Wv={Wv.shape}")
+            # 1. 处理 Q
+            Wq = hf_sd[f"{p}.self_attn.q_proj.weight"].view(cfg.num_attention_heads, head_dim, cfg.hidden_size)
+            Wq = Wq.chunk(tp_size, dim=0)[rank].reshape(-1, cfg.hidden_size)
             
-            # 2. 合并
-            combined_qkv = torch.cat([Wq, Wk, Wv], dim=0)
+            # 2. 处理 K
+            Wk = hf_sd[f"{p}.self_attn.k_proj.weight"].view(cfg.num_key_value_heads, head_dim, cfg.hidden_size)
+            Wk = Wk.chunk(tp_size, dim=0)[rank].reshape(-1, cfg.hidden_size)
             
-            # 3. 写入（确保 layer.attn.qkv 的定义与之匹配）
-            layer.attn.qkv.weight.data.copy_(combined_qkv)
-    
-            # 4. 同样处理 Bias (Qwen2.5/3 默认有 bias)
+            # 3. 处理 V
+            Wv = hf_sd[f"{p}.self_attn.v_proj.weight"].view(cfg.num_key_value_heads, head_dim, cfg.hidden_size)
+            Wv = Wv.chunk(tp_size, dim=0)[rank].reshape(-1, cfg.hidden_size)
+            
+            layer.attn.qkv.weight.data.copy_(torch.cat([Wq, Wk, Wv], dim=0))
+
+            # 4. 处理 Bias (Qwen2.5/3 默认带有 bias)
             if f"{p}.self_attn.q_proj.bias" in hf_sd:
-                Bq = hf_sd[f"{p}.self_attn.q_proj.bias"].chunk(tp_size, dim=0)[rank]
-                Bk = hf_sd[f"{p}.self_attn.k_proj.bias"].chunk(tp_size, dim=0)[rank]
-                Bv = hf_sd[f"{p}.self_attn.v_proj.bias"].chunk(tp_size, dim=0)[rank]
+                Bq = hf_sd[f"{p}.self_attn.q_proj.bias"].view(cfg.num_attention_heads, head_dim)
+                Bq = Bq.chunk(tp_size, dim=0)[rank].reshape(-1)
+                Bk = hf_sd[f"{p}.self_attn.k_proj.bias"].view(cfg.num_key_value_heads, head_dim)
+                Bk = Bk.chunk(tp_size, dim=0)[rank].reshape(-1)
+                Bv = hf_sd[f"{p}.self_attn.v_proj.bias"].view(cfg.num_key_value_heads, head_dim)
+                Bv = Bv.chunk(tp_size, dim=0)[rank].reshape(-1)
                 layer.attn.qkv.bias.data.copy_(torch.cat([Bq, Bk, Bv], dim=0))
+
+            # --- 5. 处理 MLP (也需要 TP 切分) ---
+            # Gate/Up 是 ColumnParallel，Down 是 RowParallel
+            W_gate_up = hf_sd[f"{p}.mlp.gate_proj.weight"], hf_sd[f"{p}.mlp.up_proj.weight"]
+            W_gate_tp = W_gate_up[0].chunk(tp_size, dim=0)[rank]
+            W_up_tp = W_gate_up[1].chunk(tp_size, dim=0)[rank]
+            layer.mlp.gate_up.weight.data.copy_(torch.cat([W_gate_tp, W_up_tp], dim=0))
+            
+            W_down = hf_sd[f"{p}.mlp.down_proj.weight"].chunk(tp_size, dim=1)[rank]
+            layer.mlp.down.weight.data.copy_(W_down)
 
     def forward(self, input_ids, request_ids, pos, block_mgr, is_prefill=False, cu_seqlens=None, max_seqlen=None):
         x = self.embedding(input_ids).half()
         for layer in self.layers:
             x = layer(x, request_ids, pos, block_mgr, is_prefill, cu_seqlens, max_seqlen)
         return self.lm_head(self.norm(x))
+
+
+
+
+
