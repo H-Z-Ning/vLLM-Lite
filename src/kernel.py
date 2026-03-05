@@ -29,6 +29,22 @@ class BlockManager:
             self.free_blocks.extend(self.request_to_blocks[request_id])
             del self.request_to_blocks[request_id]
 
+    def truncate_request(self, request_id, new_total_tokens):
+        """
+        将 request 的缓存截断到 new_total_tokens 所需的块数，释放多余的块。
+        """
+        if request_id not in self.request_to_blocks:
+            return
+        blocks = self.request_to_blocks[request_id]
+        needed_blocks = (new_total_tokens + self.block_size - 1) // self.block_size
+        current_blocks = len(blocks)
+        if needed_blocks < current_blocks:
+            # 释放多余的块
+            extra_blocks = blocks[needed_blocks:]
+            self.free_blocks.extend(extra_blocks)
+            self.request_to_blocks[request_id] = blocks[:needed_blocks]
+        # 若 needed_blocks > current_blocks，由 allocate_blocks_for_request 负责分配
+
 
 
 class AttentionPaged(nn.Module):
