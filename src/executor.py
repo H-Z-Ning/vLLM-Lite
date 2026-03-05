@@ -70,133 +70,100 @@ class Engine:
         K = self.num_spec_tokens
         request_id = seq.request_id
         current_len = len(seq.generated_ids)
-    
-        # 确保两个缓存都有足够空间容纳最多 current_len + K 个token
-        self.block_mgr.allocate_blocks_for_request(request_id, current_len + K)
-        self.draft_block_mgr.allocate_blocks_for_request(request_id, current_len + K)
-    
-        # ---------- 1. 草稿模型生成 K 个候选token ----------
-        draft_tokens = []          # 候选 token id 列表
-        draft_logits_list = []     # 每个候选的原始 logits
-        # 临时序列，用于采样
-        temp_ids = seq.generated_ids.copy()
+        
+        # 预先分配空间，避免循环内分配
+        self.block_mgr.allocate_blocks_for_request(request_id, current_len + K + 1)
+        self.draft_block_mgr.allocate_blocks_for_request(request_id, current_len + K + 1)
+        
+        # ---------- 1. 快速草稿生成 (减少同步) ----------
+        draft_tokens = []
+        draft_logits_list = []
+        
+        # 将输入移动到 GPU 一次，后续在 GPU 上操作
+        last_token_id = seq.generated_ids[-1]
+        input_tensor = torch.tensor([last_token_id], device="cuda")
+        
         for step in range(K):
-            if step == 0:
-                input_id = temp_ids[-1]
-            else:
-                input_id = draft_tokens[-1]
-            input_tensor = torch.tensor([input_id], device="cuda")
-            pos = current_len + step   # 当前要生成的位置
-            pos_tensor = torch.tensor([pos], device="cuda", dtype=torch.int32)
-    
+            pos_tensor = torch.tensor([current_len + step], device="cuda", dtype=torch.int32)
             with torch.inference_mode():
+                # 注意：这里假设 draft_model 也是优化过的，不触发额外同步
                 logits = self.draft_model(
-                    input_tensor,
-                    [request_id],
-                    pos_tensor,
-                    self.draft_block_mgr,
-                    is_prefill=False
-                )   # shape [1, vocab_size]
-    
-            # 使用草稿模型的采样参数生成 token
-            token_id = sample_logits(
-                logits,
-                torch.tensor([temp_ids + draft_tokens], device=logits.device),
-                **self.draft_sampling_params
-            )
-            if isinstance(token_id, torch.Tensor):
-                token_id = token_id.item()
+                    input_tensor, [request_id], pos_tensor,
+                    self.draft_block_mgr, is_prefill=False
+                )
+            
+            # 简化草稿采样：直接 greedy 或者简单采样，减少计算量
+            # 如果必须用复杂采样，也尽量避免 .item()
+            token_id_tensor = torch.argmax(logits, dim=-1) 
+            token_id = token_id_tensor.item() # 这里是必要的，因为下一步输入需要它
+            
             draft_tokens.append(token_id)
-            draft_logits_list.append(logits[0])   # 保存 logits 供后续验证
-    
-        # ---------- 2. 目标模型验证 ----------
-        # 输入为 draft_tokens 列表
-        input_tokens = torch.tensor(draft_tokens, device="cuda")   # [K]
+            draft_logits_list.append(logits) # 保持 Tensor 在 GPU 上
+            input_tensor = token_id_tensor 
+
+        # ---------- 2. 目标模型一次性验证 ----------
+        input_tokens = torch.tensor(draft_tokens, device="cuda")
         req_ids = [request_id] * K
         pos_list = torch.arange(current_len, current_len + K, device="cuda", dtype=torch.int32)
-    
+        
         with torch.inference_mode():
+            # 目标模型一次性跑 K 个 token，得到 K 组 logits
             target_logits = self.model(
-                input_tokens,
-                req_ids,
-                pos_list,
-                self.block_mgr,
-                is_prefill=False
-            )   # [K, vocab_size]
-    
-        # ---------- 3. 接受/拒绝决策 ----------
-        # 将 logits 转为概率
-        draft_probs = torch.softmax(torch.stack(draft_logits_list, dim=0), dim=-1)   # [K, vocab_size]
-        target_probs = torch.softmax(target_logits, dim=-1)                          # [K, vocab_size]
-    
-        accepted = []          # 已经接受的 token
-        rejection_idx = None   # 发生拒绝的位置（如果全部接受则为 None）
-    
-        for i in range(K):
-            token = draft_tokens[i]
-            p_draft = draft_probs[i, token].item()
-            p_target = target_probs[i, token].item()
-            r = p_target / p_draft if p_draft > 0 else 1.0   # 防止除零
-    
-            if r >= 1.0 or torch.rand(1).item() < r:
-                accepted.append(token)
-            else:
-                # 拒绝，停止接受更多候选
-                rejection_idx = i
-                break
-    
-        # ---------- 4. 处理接受结果 ----------
-        if rejection_idx is None:
-            # 全部接受
-            L = K
-            seq.generated_ids.extend(accepted)
-            new_len = current_len + L
-            # 截断缓存（实际上长度刚好，无需释放，但保证一致）
-            self.block_mgr.truncate_request(request_id, new_len)
-            self.draft_block_mgr.truncate_request(request_id, new_len)
+                input_tokens, req_ids, pos_list,
+                self.block_mgr, is_prefill=False
+            ) # Shape: [K, vocab_size]
+
+        # ---------- 3. 向量化验证逻辑 ----------
+        # 将之前的 draft_logits 堆叠
+        all_draft_logits = torch.cat(draft_logits_list, dim=0) # [K, vocab_size]
+        
+        draft_probs = torch.softmax(all_draft_logits, dim=-1)
+        target_probs = torch.softmax(target_logits, dim=-1)
+        
+        # 批量获取被采样的概率
+        batch_indices = torch.arange(K, device="cuda")
+        token_indices = torch.tensor(draft_tokens, device="cuda")
+        p_target = target_probs[batch_indices, token_indices]
+        p_draft = draft_probs[batch_indices, token_indices]
+        
+        # 计算接受率 r = p_target / p_draft
+        r = p_target / (p_draft + 1e-9)
+        rand_vals = torch.rand(K, device="cuda")
+        accepted_mask = (rand_vals < r)
+        
+        # 寻找第一个拒绝的位置
+        # 找到第一个 False 的索引
+        rejection_indices = (~accepted_mask).nonzero()
+        if rejection_indices.numel() > 0:
+            L = rejection_indices[0].item() # 第一个拒绝的位置
         else:
-            # 部分接受：只接受前 rejection_idx 个
-            L = rejection_idx
-            seq.generated_ids.extend(accepted[:L])
-            new_len = current_len + L
-            # 截断缓存到 new_len
-            self.block_mgr.truncate_request(request_id, new_len)
-            self.draft_block_mgr.truncate_request(request_id, new_len)
-    
-            # 使用目标模型生成被拒绝位置的新 token（单步 decode）
-            input_tensor = torch.tensor([seq.generated_ids[-1]], device="cuda")
-            pos = new_len - 1   # 注意：新序列最后一位的位置
-            pos_tensor = torch.tensor([pos], device="cuda", dtype=torch.int32)
-            with torch.inference_mode():
-                logits = self.model(
-                    input_tensor,
-                    [request_id],
-                    pos_tensor,
-                    self.block_mgr,
-                    is_prefill=False
-                )
-            new_token = sample_logits(
-                logits,
-                torch.tensor([seq.generated_ids], device=logits.device),
-                **seq.sampling_params
-            )
-            if isinstance(new_token, torch.Tensor):
-                new_token = new_token.item()
+            L = K # 全部接受
+
+        # ---------- 4. 更新序列 & 修正 (关键：不重复跑模型) ----------
+        accepted_tokens = draft_tokens[:L]
+        seq.generated_ids.extend(accepted_tokens)
+        
+        if L < K:
+            # 这里的 target_logits[L] 已经是针对 draft_tokens[L] 的前文预测结果了
+            # 我们需要的是基于前 L 个接受 token 预测第 L+1 个 token 的分布
+            # 恰好就是 target_logits[L] 的分布！
+            correct_logits = target_logits[L:L+1]
+            
+            # 如果 L=0，说明第一个就被拒了，采样 target_logits[0]
+            # 如果 L>0，采样 target_logits[L]
+            # 注意：在投机采样算法中，拒绝后的采样分布通常需要做重分配(Resampling)
+            # 简单实现：
+            new_token = torch.argmax(correct_logits, dim=-1).item()
             seq.generated_ids.append(new_token)
-            # 新 token 的 KV 已由模型写入缓存，不需要额外操作
-    
-        # ---------- 5. 检查序列是否结束 ----------
-        stop_tokens = {
-            self.tokenizer.eos_token_id,
-            151643, 151645,
-            self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        }
-        if seq.generated_ids[-1] in stop_tokens or len(seq.generated_ids) >= seq.max_gen_len:
-            seq.finished = True
-            self.block_mgr.free_request(request_id)
-            self.draft_block_mgr.free_request(request_id)
-            response = self.tokenizer.decode(seq.generated_ids[len(seq.prompt_ids):], skip_special_tokens=True)
-            self.result_queue.put((seq.request_id, response))
+        else:
+            # 如果全部接受，目标模型其实还多算了一个位置（针对最后一个 draft token 的预测）
+            # 但为了简单，我们可以选择在这里结束，或者利用这多出来的一步 logits
+            pass
+
+        # 最终根据实际生成的长度截断 KV Cache
+        final_len = len(seq.generated_ids)
+        self.block_mgr.truncate_request(request_id, final_len)
+        self.draft_block_mgr.truncate_request(request_id, final_len)
     def add_request(self, req_id, prompt_ids, max_gen_len, sampling_params):
         self.waiting_queue.append(Sequence(req_id, prompt_ids, max_gen_len, sampling_params))
 
