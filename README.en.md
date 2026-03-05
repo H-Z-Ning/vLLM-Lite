@@ -40,11 +40,14 @@ Ensure your environment has CUDA 12.x and Flash Attention 2.0+ installed:
 ```bash
 pip install torch transformers==4.43.1 pyyaml flash-attn --no-build-isolation
 ```
+```bash
+huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct --local-dir /root/base_model/qwen/
+```
 
 ### 2. Configuration
 Set your model path in `config.yaml` (supports mainstream architectures like Qwen2 / Llama by default):
 ```yaml
-model_path: "Qwen/Qwen2.5-1.5B-Instruct"
+model_path: "/root/base_model/qwen/Qwen2___5-0___5B-Instruct"
 cache_config:
   num_blocks: 1024  # Total number of KV Cache blocks
   block_size: 256   # Number of tokens per block
